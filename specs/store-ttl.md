@@ -82,3 +82,15 @@ cannot be recovered from the predicate's return values alone.
 already on `TtlCacheBuilder`, `TtlSortedCacheBuilder`, and `ShardedLruTtlCacheBuilder`. All three
 spellings set the same per-entry TTL override described in TTL-4. See
 [builders.md](builders.md) BUILD-5.
+
+## TTL-10
+
+`TtlSortedCache` keeps a monotonic eviction high-water mark. Mutable paths persist the largest
+observed clock reading and use `max(now, clock_horizon)` as the expiry cutoff; shared reads use
+the same saturation without updating the mark. A backward clock step therefore cannot revive a
+deadline that an earlier cleanup horizon had already reached or move the sweep cutoff backwards.
+The regular sweep remains prefix-only in the deadline `BTreeSet`, costing `O(log n + removed)`
+with no whole-map scan after a clock adjustment. Native targets use `web_time::Instant` as
+`std::time::Instant`, so ordinary system wall-clock steps do not exercise the saturation path;
+the high-water mark also covers clock fakes and non-monotonic `Instant` sources. See
+[design/0057-clock-rollback-eviction-horizon.md](design/0057-clock-rollback-eviction-horizon.md).

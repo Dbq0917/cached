@@ -140,16 +140,11 @@ impl<K, V> Entry<K, V> {
     /// Returns `true` if the entry's expiry instant has passed as of `now`.
     ///
     /// Expiry is at-or-after the deadline (`now >= expiry`), matching
-    /// [`TtlCache`](super::TtlCache) / `LruTtlCache`. Split from [`is_expired`](Self::is_expired)
-    /// so the boundary can be unit-tested with a controlled `now` (the real monotonic clock
-    /// never yields an exact `now == expiry` tie deterministically).
+    /// [`TtlCache`](super::TtlCache) / `LruTtlCache`. Taking `now` explicitly keeps the clock
+    /// sample consistent across an operation and makes the boundary unit-testable; the real
+    /// monotonic clock never yields an exact `now == expiry` tie deterministically.
     fn is_expired_at(&self, now: Instant) -> bool {
         self.expiry.is_some_and(|e| e <= now)
-    }
-
-    /// Returns `true` if the entry's expiry instant has passed as of the current time.
-    fn is_expired(&self) -> bool {
-        self.is_expired_at(Instant::now())
     }
 }
 
@@ -204,6 +199,11 @@ pub struct TtlSortedCache<K, V, S = DefaultHashBuilder> {
     // of the cache
     min_instant: Instant,
 
+    // Largest clock reading observed by a mutating operation. The eviction horizon is the
+    // maximum of a new sample and this value, so a backward step of the underlying clock
+    // cannot make an already-reached deadline appear future again.
+    clock_horizon: Instant,
+
     // k/v where entry contains corresponds to an ordered value in `keys`
     map: HashMap<K, Entry<K, V>, S>,
 
@@ -235,6 +235,15 @@ impl<K, V, S> std::fmt::Debug for TtlSortedCache<K, V, S> {
     }
 }
 
+impl<K, V, S> TtlSortedCache<K, V, S> {
+    /// Current liveness cutoff for `&self` read paths. Mutable paths persist a new high-water
+    /// mark through `observe_clock`; shared reads saturate against the stored mark without
+    /// being able to update it.
+    fn liveness_now(&self) -> Instant {
+        Instant::now().max(self.clock_horizon)
+    }
+}
+
 impl<K, V, S> Clone for TtlSortedCache<K, V, S>
 where
     K: Clone + Hash + Eq + Ord,
@@ -244,6 +253,7 @@ where
     fn clone(&self) -> Self {
         Self {
             min_instant: self.min_instant,
+            clock_horizon: self.clock_horizon,
             map: self.map.clone(),
             keys: self.keys.clone(),
             ttl: self.ttl,
@@ -406,6 +416,7 @@ impl<K, V, S> TtlSortedCacheBuilder<K, V, S> {
         K: Hash + Eq + Ord + Clone,
         S: BuildHasher,
     {
+        let built_at = Instant::now();
         let ttl = self.ttl.ok_or(super::BuildError::MissingRequired("ttl"))?;
         super::validate_ttl(ttl)?;
         if self.size == Some(0) {
@@ -415,7 +426,8 @@ impl<K, V, S> TtlSortedCacheBuilder<K, V, S> {
             });
         }
         let mut cache = TtlSortedCache {
-            min_instant: Instant::now(),
+            min_instant: built_at,
+            clock_horizon: built_at,
             map: HashMap::with_hasher(self.hasher),
             keys: BTreeSet::new(),
             ttl,
@@ -558,7 +570,24 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> TtlSortedCache<K, V, S> {
     /// Returns number of dropped items.
     #[must_use]
     pub fn evict(&mut self) -> usize {
-        self.evict_at(Instant::now())
+        let now = self.observe_clock(Instant::now());
+        self.evict_at(now)
+    }
+
+    /// Advance the monotonic eviction horizon and return the cutoff to use.
+    ///
+    /// The deadline index stays ordered by absolute expiry. Saturating the cutoff at the
+    /// largest previously observed reading additionally prevents a non-monotonic clock from
+    /// moving the sweep backwards and reviving entries that an earlier sweep horizon had
+    /// already reached. Production targets use the monotonic `Instant` re-export, where this
+    /// maximum is the new sample in ordinary operation.
+    fn observe_clock(&mut self, now: Instant) -> Instant {
+        if now > self.clock_horizon {
+            self.clock_horizon = now;
+            now
+        } else {
+            self.clock_horizon
+        }
     }
 
     /// [`evict`](Self::evict) against an explicit `cutoff`, so a caller that already sampled
@@ -674,7 +703,7 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> TtlSortedCache<K, V, S> {
     /// removes solely on the predicate.
     pub fn retain<F: FnMut(&K, &V) -> bool>(&mut self, mut keep: F) -> usize {
         // Sample the clock once so every entry is judged against the same instant.
-        let now = Instant::now();
+        let now = self.observe_clock(Instant::now());
         // Pass 1 runs the caller's predicate WITHOUT touching either structure, collecting
         // the doomed stamps. An eager removal here (the natural `extract_if` shape) hands
         // already-yielded entries to the collecting iterator, so a panicking `keep` unwinds
@@ -731,7 +760,8 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> TtlSortedCache<K, V, S> {
     /// regardless of the predicate, but ignores [`max_size`](TtlSortedCacheBuilder::max_size)
     /// and returns a `usize` count of its own).
     pub fn retain_latest(&mut self, count: usize, evict: bool) -> usize {
-        self.retain_latest_at(count, evict.then(Instant::now))
+        let cutoff = evict.then(|| self.observe_clock(Instant::now()));
+        self.retain_latest_at(count, cutoff)
     }
 
     /// [`retain_latest`](Self::retain_latest) with the expiry sweep driven by an explicit
@@ -896,17 +926,18 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> TtlSortedCache<K, V, S> {
     ) -> (Option<V>, Stamped<K>) {
         let effective_ttl = ttl.unwrap_or(self.ttl);
 
-        // Sample the clock ONCE for the whole operation: the new expiry, the displaced
-        // entry's expiry check, and any eager sweep below are all judged against this
-        // instant instead of taking two or three separate `Instant::now()` readings.
-        let now = Instant::now();
+        // Sample the clock ONCE for the whole operation. The new deadline is anchored to the
+        // raw reading; expiry checks and sweeps use the saturated horizon so a backward clock
+        // step cannot move the cleanup cutoff backwards.
+        let sampled_now = Instant::now();
+        let now = self.observe_clock(sampled_now);
 
         // A zero TTL means "never expires": store expiry = None. `checked_add`
         // returning `None` on overflow lands on the same never-expires representation.
         let expiry = if effective_ttl.is_zero() {
             None
         } else {
-            now.checked_add(effective_ttl)
+            sampled_now.checked_add(effective_ttl)
         };
 
         // `entry` rather than `insert`: on the occupied path the existing `Entry` already owns
@@ -1159,7 +1190,7 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> Cached<K, V> for TtlSortedCa
                 self.misses.increment();
                 return None;
             }
-            Some(entry) => entry.is_expired(),
+            Some(entry) => entry.is_expired_at(self.liveness_now()),
         };
 
         if is_expired {
@@ -1182,7 +1213,7 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> Cached<K, V> for TtlSortedCa
                 self.misses.increment();
                 return None;
             }
-            Some(entry) => entry.is_expired(),
+            Some(entry) => entry.is_expired_at(self.liveness_now()),
         };
 
         if is_expired {
@@ -1205,7 +1236,10 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> Cached<K, V> for TtlSortedCa
         // entry in place instead of dropping it (and does not fire `on_evict` prematurely).
         // The borrow from `map.get` ends with the `matches!`, so the counters/`get_mut` below
         // are free to borrow `self` again (the Polonius limitation, see `cache_get`).
-        let live = matches!(self.map.get(&key), Some(entry) if !entry.is_expired());
+        let live = matches!(
+            self.map.get(&key),
+            Some(entry) if !entry.is_expired_at(self.liveness_now())
+        );
         if live {
             self.hits.increment();
             return self
@@ -1232,7 +1266,10 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> Cached<K, V> for TtlSortedCa
         // Same structure as `cache_get_or_set_with_mut`: check liveness without removing, run
         // the factory, replace only on `Ok`. On `Err` the (expired or absent) entry is left
         // exactly as it was and `on_evict` does not fire, matching `TtlCache` / `LruTtlCache`.
-        let live = matches!(self.map.get(&key), Some(entry) if !entry.is_expired());
+        let live = matches!(
+            self.map.get(&key),
+            Some(entry) if !entry.is_expired_at(self.liveness_now())
+        );
         if live {
             self.hits.increment();
             return Ok(self
@@ -1256,7 +1293,7 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> Cached<K, V> for TtlSortedCa
         match self.map.remove(key) {
             None => None,
             Some(removed) => {
-                let expired = removed.is_expired();
+                let expired = removed.is_expired_at(self.liveness_now());
                 self.keys.remove(&removed.as_stamped());
                 // The stored key `Arc` derefs to `&K` directly: no clone is needed to hand the
                 // callback a reference (and the clone previously ran even without a callback).
@@ -1308,7 +1345,9 @@ impl<K: Hash + Eq + Ord + Clone, V, S: BuildHasher> Cached<K, V> for TtlSortedCa
         self.map.clear();
         self.map.shrink_to(self.initial_capacity.unwrap_or(0));
         self.keys = BTreeSet::new();
-        self.min_instant = Instant::now();
+        let now = Instant::now();
+        self.min_instant = now;
+        self.clock_horizon = now;
         self.cache_reset_metrics();
     }
 
@@ -1364,8 +1403,10 @@ impl<K: Hash + Eq + Ord, V, S: BuildHasher> CachedIter<K, V> for TtlSortedCache<
         // The clock is read per item rather than hoisted into a construction-time snapshot:
         // this iterator is lazy and may be held across a long consumer loop, where a stale
         // snapshot would report entries that have since expired as live.
-        self.map.iter().filter_map(|(k, entry)| {
-            if entry.is_expired() {
+        let horizon = self.clock_horizon;
+        self.map.iter().filter_map(move |(k, entry)| {
+            let now = Instant::now().max(horizon);
+            if entry.is_expired_at(now) {
                 None
             } else {
                 Some((k, &entry.value))
@@ -1425,8 +1466,9 @@ impl<K: Hash + Eq + Ord, V, S: BuildHasher> CachedPeek<K, V> for TtlSortedCache<
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        let now = self.liveness_now();
         self.map.get(key).and_then(|entry| {
-            if entry.is_expired() {
+            if entry.is_expired_at(now) {
                 None
             } else {
                 Some(&entry.value)
@@ -1459,12 +1501,13 @@ impl<K: Hash + Eq + Ord + Clone, V: Clone, S: BuildHasher + Clone> CloneCached<K
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        let now = self.liveness_now();
         match self.map.get(k) {
             None => {
                 self.misses.increment();
                 (None, false)
             }
-            Some(entry) if entry.is_expired() => {
+            Some(entry) if entry.is_expired_at(now) => {
                 self.misses.increment();
                 (Some(entry.value.clone()), true)
             }
@@ -1486,9 +1529,10 @@ impl<K: Hash + Eq + Ord + Clone, V: Clone, S: BuildHasher + Clone> CloneCached<K
         Q: Hash + Eq + ?Sized,
         V: Clone,
     {
+        let now = self.liveness_now();
         match self.map.get(k) {
             None => (None, false),
-            Some(entry) if entry.is_expired() => (Some(entry.value.clone()), true),
+            Some(entry) if entry.is_expired_at(now) => (Some(entry.value.clone()), true),
             Some(entry) => (Some(entry.value.clone()), false),
         }
     }
@@ -1567,7 +1611,10 @@ where
             // version, an expired entry is left in place for `set_and_get_mut` to displace
             // (which fires `on_evict` and counts the eviction) rather than being swept before
             // the future runs, so a dropped/panicking future leaves the stale entry alone.
-            let live = matches!(self.map.get(&k), Some(entry) if !entry.is_expired());
+            let live = matches!(
+                self.map.get(&k),
+                Some(entry) if !entry.is_expired_at(self.liveness_now())
+            );
             if live {
                 self.hits.increment();
                 return self
@@ -1605,7 +1652,10 @@ where
             // `Ok` (which fires `on_evict` and counts the eviction) rather than being swept
             // up front, so a factory `Err` or a dropped/cancelled future leaves the stale entry
             // alone.
-            let live = matches!(self.map.get(&k), Some(entry) if !entry.is_expired());
+            let live = matches!(
+                self.map.get(&k),
+                Some(entry) if !entry.is_expired_at(self.liveness_now())
+            );
             if live {
                 self.hits.increment();
                 return Ok(self
@@ -4969,6 +5019,63 @@ mod test {
         );
         assert!(cache.map.is_empty());
         assert_index_lockstep(&cache, "after sweeping below min_instant");
+    }
+
+    #[test]
+    fn clock_rollback_does_not_roll_back_the_eviction_horizon() {
+        let mut cache = TtlSortedCache::<u32, u32>::builder()
+            .ttl(Duration::from_secs(60))
+            .build()
+            .unwrap();
+
+        // Deterministically place the store just after a backward clock step. The previous
+        // clock reading reached `previous_reading`; the stepped-back reading is `rewound_to`.
+        let rewound_to = Instant::now() + Duration::from_secs(10_000);
+        let previous_reading = rewound_to + Duration::from_secs(5);
+        cache.clock_horizon = previous_reading;
+
+        // This short-deadline entry is the first stamp and is still live at `rewound_to`.
+        insert_raw(&mut cache, 0, 0, Some(rewound_to + Duration::from_secs(1)));
+        for key in 1u32..64 {
+            let deadline = rewound_to + Duration::from_millis(2_000 + u64::from(key));
+            insert_raw(&mut cache, key, key * 10, Some(deadline));
+        }
+
+        assert_eq!(
+            cache.evict_at(rewound_to),
+            0,
+            "at the rewound reading every deadline is still in the future"
+        );
+        assert_eq!(cache.cache_size(), 64);
+
+        assert_eq!(cache.evict(), 64);
+        assert_eq!(
+            cache.cache_size(),
+            0,
+            "the eviction horizon stays monotonic"
+        );
+        assert_index_lockstep(&cache, "after a clock-rollback sweep");
+    }
+
+    #[test]
+    fn clock_rollback_does_not_revive_an_entry_for_reads() {
+        let mut cache = TtlSortedCache::<u32, u32>::builder()
+            .ttl(Duration::from_secs(60))
+            .build()
+            .unwrap();
+
+        let rewound_to = Instant::now() + Duration::from_secs(10_000);
+        cache.clock_horizon = rewound_to + Duration::from_secs(5);
+        insert_raw(
+            &mut cache,
+            1,
+            100,
+            Some(rewound_to + Duration::from_secs(1)),
+        );
+
+        assert_eq!(cache.cache_get(&1u32), None);
+        assert!(!cache.map.contains_key(&1u32));
+        assert_index_lockstep(&cache, "after a read under a rolled-back clock");
     }
 
     /// Deferred callbacks must still fire in expiry order, exactly once per entry actually

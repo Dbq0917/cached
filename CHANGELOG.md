@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep `TtlSortedCache` cleanup effective if its clock source moves backwards. The store now
+  saturates expiry judgments and sweep cutoffs at the largest observed clock reading, so a
+  backward step cannot revive deadlines already reached by an earlier cleanup horizon. Sweeps
+  stay prefix-only in the deadline `BTreeSet`; no periodic full-map scan is added. Native
+  builds already use the monotonic `std::time::Instant`; the high-water mark also covers clock
+  fakes and non-monotonic time sources.
+
 ## [4.1.1] - 2026-11-03
 
 ### Fixed
