@@ -45,3 +45,11 @@ and the per-setter errors (`SetMaxSizeError`, `SetTtlError`) are re-exported at 
 [store-ttl.md](store-ttl.md) TTL-4) gains `.ttl_secs(u64)` and `.ttl_millis(u64)` alongside its
 existing `.ttl(Duration)`, matching the whole-cache TTL setters already on `TtlCacheBuilder`,
 `TtlSortedCacheBuilder`, and `ShardedLruTtlCacheBuilder`. See [store-ttl.md](store-ttl.md) TTL-9.
+
+## BUILD-6
+
+`RedbCacheBuilder::flush_interval(Duration)` sets the maximum interval between coalesced durable
+commits when `durable(false)` (the default). The interval defaults to 500 ms
+(`RedbCacheBuilder::DEFAULT_FLUSH_INTERVAL`) and must be non-zero; `durable(true)` is the
+per-write-fsync mode. See [store-redb.md](store-redb.md) REDB-8 and
+[design/0058-redb-bounded-durability.md](design/0058-redb-bounded-durability.md).

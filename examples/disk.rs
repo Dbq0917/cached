@@ -68,9 +68,9 @@ fn main() {
 
     // Cheap-writes-then-flush pattern: build a cache with
     // `durable(false)` so each write commits with
-    // `Durability::None` (no per-write fsync). This trades per-write durability
-    // for write throughput; call `flush()` at a chosen point (periodically or
-    // before shutdown) to force a single durable commit that persists them all.
+    // `Durability::None` (no per-write fsync). A background flusher bounds the
+    // crash-loss window to the flush interval (500 ms by default); call
+    // `flush()` to force one durable commit that persists everything so far.
     use cached::RedbCache;
     let cache: RedbCache<u64, u64> = RedbCache::builder("disk-example-flush")
         .durable(false)

@@ -60,3 +60,14 @@ entries whose age is >= the current TTL, 0 with no TTL), `undecodable`, and the 
 `created_at`. It never writes: no self-heal, no eviction, no refresh, and undecodable entries are
 counted rather than surfaced as errors in both deserialization modes. `cache_size()` stays
 `Ok(None)`. See [design/0056-redb-scan-stats.md](design/0056-redb-scan-stats.md).
+
+## REDB-8
+
+The default durability is `durable(false)`: each mutation commits with `Durability::None`, and a
+background flusher promotes pending writes with a durable (`Immediate`) commit at least once per
+flush interval (500 ms by default, configurable with `RedbCacheBuilder::flush_interval`). A crash
+or power loss can therefore lose at most the writes since the last completed flush, rather than
+an unbounded history. `flush()` / `async_flush()` force a durable commit immediately; dropping
+the cache performs a final pending flush. `durable(true)` remains the per-write fsync mode. A
+zero flush interval is rejected at build time. See
+[design/0058-redb-bounded-durability.md](design/0058-redb-bounded-durability.md).

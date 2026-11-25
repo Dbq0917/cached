@@ -4,7 +4,7 @@ use crate::{
     ConcurrentCacheBase, ConcurrentCacheRefreshOnHit, ConcurrentCacheTtl, ConcurrentCached,
 };
 use directories::BaseDirs;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use redb::{Builder, Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -13,7 +13,8 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle;
 
 /// The single redb table used for all disk cache entries. Keys are the
 /// stringified cache keys, values are the rmp-serialized [`CachedDiskValue`].
@@ -23,6 +24,7 @@ pub struct RedbCacheBuilder<K, V> {
     ttl: Option<Duration>,
     refresh: bool,
     durable: bool,
+    flush_interval: Duration,
     disk_dir: Option<PathBuf>,
     cache_name: Option<String>,
     strict_deserialization: bool,
@@ -124,6 +126,10 @@ where
     K: ToString,
     V: Serialize + DeserializeOwned,
 {
+    /// Default interval between coalesced durable commits when [`durable`](Self::durable) is
+    /// `false`.
+    pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+
     /// Initialize a `RedbCacheBuilder`.
     ///
     /// The cache name is required; set it with [`name`](Self::name) before calling
@@ -133,7 +139,8 @@ where
         Self {
             ttl: None,
             refresh: false,
-            durable: true,
+            durable: false,
+            flush_interval: Self::DEFAULT_FLUSH_INTERVAL,
             disk_dir: None,
             cache_name: None,
             strict_deserialization: false,
@@ -213,22 +220,44 @@ where
         self
     }
 
-    /// Set whether writes are durable: fsync'd to disk before the call returns.
+    /// Set the write durability policy.
     ///
-    /// When `true` (the default), every write commits with
-    /// [`redb::Durability::Immediate`], guaranteeing the change is fsync'd to disk
-    /// before the call returns. This makes the cache durable by default, which is
-    /// usually what you want from a disk-backed store.
+    /// `true` commits every mutation with [`redb::Durability::Immediate`]: the change is
+    /// fsync'd to disk before the call returns. This is the strongest guarantee and the
+    /// highest write cost; use it for values whose loss is unacceptable.
     ///
-    /// Set `false` to trade durability for write throughput: writes then commit with
-    /// [`redb::Durability::None`] (no fsync). Per redb's semantics, a `Durability::None`
-    /// commit is not guaranteed to be persisted until a later `Durability::Immediate`
-    /// commit occurs, so writes made with `false` may be lost on process exit or crash,
-    /// not only on an unclean shutdown. When using `false`, call [`RedbCache::flush`]
-    /// (or [`RedbCache::async_flush`]) at chosen points to force a durable commit.
+    /// `false` (the default) commits each mutation with [`redb::Durability::None`] and
+    /// coalesces fsyncs into a background durable commit at most once per
+    /// [`flush_interval`](Self::flush_interval). A crash or power loss can therefore lose at
+    /// most the writes committed since the last background flush, instead of every write
+    /// since the last explicit [`flush`](RedbCache::flush). Call `flush` directly to force a
+    /// durable commit sooner (for example, at a request boundary or before shutdown).
+    ///
+    /// `false` is not "no durability": a `Durability::None` commit is still written by redb,
+    /// and the background flusher makes a bounded window of writes durable without paying an
+    /// fsync per write. The default interval is
+    /// [`DEFAULT_FLUSH_INTERVAL`](Self::DEFAULT_FLUSH_INTERVAL) (500 ms).
     #[must_use]
     pub fn durable(mut self, durable: bool) -> Self {
         self.durable = durable;
+        self
+    }
+
+    /// Set the maximum interval between coalesced durable commits when
+    /// [`durable`](Self::durable) is `false`.
+    ///
+    /// Writes are committed to redb immediately, but a crash can lose the writes made since
+    /// the last durable commit. The background flusher issues that commit at least once per
+    /// interval while there are pending writes, bounding the loss window. Shorter intervals
+    /// reduce the window at the cost of more fsyncs; longer intervals reduce I/O at the cost
+    /// of losing more recent writes on a crash.
+    ///
+    /// The default is 500 ms. A zero interval is rejected by [`build`](Self::build); use
+    /// `durable(true)` if every write must be fsync'd. This setting has no effect when
+    /// `durable` is `true`.
+    #[must_use]
+    pub fn flush_interval(mut self, interval: Duration) -> Self {
+        self.flush_interval = interval;
         self
     }
 
@@ -325,6 +354,8 @@ where
     ///   NTFS/Windows-reserved `:` `<` `>` `"` `|` `?` `*`, or an ASCII control character
     ///   including DEL `0x7F`).
     /// - `Build(BuildError::InvalidValue { field: "ttl", .. })`: the configured TTL is zero.
+    /// - `Build(BuildError::InvalidValue { field: "flush_interval", .. })`: `durable` is `false`
+    ///   and the flush interval is zero.
     /// - `Io`: the cache directory could not be created.
     /// - `Storage`: the redb database file could not be opened or initialized. This includes a
     ///   DAMAGED file (truncated by a full disk, a killed process, an interrupted copy, or a
@@ -366,6 +397,13 @@ where
         }
         if let Some(ttl) = self.ttl {
             super::validate_ttl(ttl)?;
+        }
+        if !self.durable && self.flush_interval.is_zero() {
+            return Err(super::BuildError::InvalidValue {
+                field: "flush_interval",
+                reason: "must be greater than zero; use `durable(true)` to fsync every write",
+            }
+            .into());
         }
         let cache_dir_name = format!("{}_v{}", cache_name, DISK_FILE_VERSION);
 
@@ -417,13 +455,30 @@ where
         // see `open_database`.
         let db = open_database(&disk_path)?;
 
+        let connection = Arc::new(db);
+        let durability = WriteDurability::new(self.durable);
+        let flusher = if self.durable {
+            None
+        } else {
+            Some(
+                AutoFlusher::start(
+                    Arc::clone(&connection),
+                    self.flush_interval,
+                    durability.clone(),
+                    cache_name.clone(),
+                )
+                .map_err(RedbCacheBuildError::io)?,
+            )
+        };
+
         Ok(RedbCache {
             ttl: Mutex::new(self.ttl),
             refresh: AtomicBool::new(self.refresh),
-            durable: self.durable,
+            durability,
             disk_path,
-            connection: Arc::new(db),
+            connection,
             strict_deserialization: self.strict_deserialization,
+            _flusher: flusher,
             _phantom: self._phantom,
         })
     }
@@ -647,7 +702,17 @@ fn reject_if_symlink(path: &Path, what: &str) -> Result<(), std::io::Error> {
 /// takes an exclusive lock on its file, so two instances sharing one name/path cannot be
 /// opened at once), and/or set
 /// [`durable`](RedbCacheBuilder::durable)
-/// `false` so commits skip the fsync (trading durability for speed).
+/// `false` so commits skip the per-write fsync (trading a bounded crash-loss window for speed).
+///
+/// # Durability
+///
+/// The default is [`durable(false)`](RedbCacheBuilder::durable): writes commit immediately to
+/// redb with `Durability::None`, and a background flusher promotes pending writes with a
+/// durable commit at least once per
+/// [`flush_interval`](RedbCacheBuilder::flush_interval) (500 ms by default). A crash or power
+/// loss can lose the writes since the last durable commit, but not an unbounded history of
+/// them. [`flush`](RedbCache::flush) forces a durable commit immediately. `durable(true)`
+/// fsyncs every mutation before it returns and is the strongest guarantee.
 ///
 /// # Format stability
 ///
@@ -666,10 +731,12 @@ fn reject_if_symlink(path: &Path, what: &str) -> Result<(), std::io::Error> {
 pub struct RedbCache<K, V> {
     pub(super) ttl: Mutex<Option<Duration>>,
     pub(super) refresh: AtomicBool,
-    durable: bool,
+    durability: WriteDurability,
     disk_path: PathBuf,
     connection: Arc<Database>,
     strict_deserialization: bool,
+    // Dropping this stops and joins the flusher; it is not read on any other path.
+    _flusher: Option<AutoFlusher>,
     // `RedbCache`/`RedbCacheBuilder` own no live `K`/`V` (values are serialized
     // to disk; `K`/`V` only appear in method signatures). Use a fn-pointer
     // phantom so the type is unconditionally `Send + Sync` and does not impose
@@ -684,7 +751,7 @@ impl<K, V> std::fmt::Debug for RedbCache<K, V> {
             .field("disk_path", &self.disk_path)
             .field("ttl", &*self.ttl.lock())
             .field("refresh", &self.refresh.load(Ordering::Relaxed))
-            .field("durable", &self.durable)
+            .field("durable", &self.durability.is_durable())
             .finish_non_exhaustive()
     }
 }
@@ -729,7 +796,7 @@ where
             &self.connection,
             *self.ttl.lock(),
             self.strict_deserialization,
-            self.durable,
+            &self.durability,
         )
     }
 
@@ -737,15 +804,15 @@ where
     /// [`durable`](RedbCacheBuilder::durable)
     /// is `false`.
     ///
-    /// With `durable(false)` writes commit with `Durability::None`:
-    /// they are fast but are not guaranteed to survive a process exit or crash until a
-    /// later durable commit. Call `flush()` periodically or before shutdown to get
-    /// explicit durability points while keeping cheap writes the rest of the time. It
-    /// commits an empty transaction with immediate durability, so it is safe to call at
-    /// any time (including on an empty cache); when `durable` is
-    /// `true` (the default) every write is already durable and this is effectively a no-op.
+    /// With `durable(false)` writes commit with `Durability::None`; the background flusher
+    /// promotes pending writes at least once per
+    /// [`flush_interval`](RedbCacheBuilder::flush_interval). Call `flush()` to get an explicit
+    /// durability point sooner, for example at a request boundary or before shutdown. It
+    /// commits an empty transaction with immediate durability, so it is safe to call at any
+    /// time (including on an empty cache); when `durable` is `true` every write is already
+    /// durable and this is effectively a no-op.
     pub fn flush(&self) -> Result<(), RedbCacheError> {
-        redb_flush(&self.connection)
+        self.durability.flush(&self.connection)
     }
 
     /// Scan every stored entry and return a [`RedbCacheStats`]: the entry count, how many
@@ -804,7 +871,8 @@ where
     /// stall the async runtime.
     pub async fn async_flush(&self) -> Result<(), RedbCacheError> {
         let connection = self.connection.clone();
-        blocking::unblock(move || redb_flush(&connection)).await
+        let durability = self.durability.clone();
+        blocking::unblock(move || durability.flush(&connection)).await
     }
 
     /// Async counterpart of [`remove_expired_entries`](RedbCache::remove_expired_entries):
@@ -814,9 +882,9 @@ where
         let connection = self.connection.clone();
         let ttl = *self.ttl.lock();
         let strict = self.strict_deserialization;
-        let durable = self.durable;
+        let durability = self.durability.clone();
         blocking::unblock(move || {
-            remove_expired_entries_impl::<V>(&connection, ttl, strict, durable)
+            remove_expired_entries_impl::<V>(&connection, ttl, strict, &durability)
         })
         .await
     }
@@ -962,6 +1030,119 @@ impl<'a, V> CachedDiskValueRef<'a, V> {
     }
 }
 
+/// Shared write-durability state for the sync and async paths.
+///
+/// `durable == true` commits with [`Durability::Immediate`] and never increments the pending
+/// counter. `durable == false` commits with [`Durability::None`] and tracks how many mutations
+/// have happened, so the background flusher can tell whether it has anything to persist.
+#[derive(Clone)]
+struct WriteDurability {
+    durable: bool,
+    written: Arc<AtomicU64>,
+    flushed: Arc<AtomicU64>,
+}
+
+impl WriteDurability {
+    fn new(durable: bool) -> Self {
+        Self {
+            durable,
+            written: Arc::new(AtomicU64::new(0)),
+            flushed: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn is_durable(&self) -> bool {
+        self.durable
+    }
+
+    fn mark_write(&self) {
+        if !self.durable {
+            self.written.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn has_pending_writes(&self) -> bool {
+        self.written.load(Ordering::Acquire) != self.flushed.load(Ordering::Acquire)
+    }
+
+    fn flush(&self, connection: &Database) -> Result<(), RedbCacheError> {
+        // Take the target before opening the flush transaction. A writer that starts after
+        // this snapshot but wins the redb writer lock before the flush is either included in
+        // this flush (and then was counted) or commits after it (and remains pending).
+        let target = self.written.load(Ordering::Acquire);
+        redb_flush(connection)?;
+        self.flushed.store(target, Ordering::Release);
+        Ok(())
+    }
+
+    fn flush_if_needed(&self, connection: &Database) -> Result<(), RedbCacheError> {
+        if self.has_pending_writes() {
+            self.flush(connection)?;
+        }
+        Ok(())
+    }
+}
+
+/// Coalescing background flusher for `durable(false)` caches.
+///
+/// redb only exposes per-commit `Durability::None` / `Durability::Immediate`, so bounded
+/// crash-loss is implemented here: a non-durable commit is cheap, and this thread promotes
+/// everything committed so far to durable at most once per interval. It wakes immediately on
+/// drop so a graceful shutdown still persists pending writes.
+struct AutoFlusher {
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl AutoFlusher {
+    fn start(
+        connection: Arc<Database>,
+        interval: Duration,
+        durability: WriteDurability,
+        cache_name: String,
+    ) -> std::io::Result<Self> {
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread_wake = Arc::clone(&wake);
+        let thread = std::thread::Builder::new()
+            .name(format!("cached-redb-flush-{cache_name}"))
+            .spawn(move || {
+                let mut stopped = thread_wake.0.lock();
+                loop {
+                    if *stopped {
+                        break;
+                    }
+                    thread_wake.1.wait_for(&mut stopped, interval);
+                    if *stopped {
+                        break;
+                    }
+                    drop(stopped);
+                    // A failed flush stays pending (`flushed` is only advanced on success),
+                    // so the next tick retries it. Drop cannot report the error; redb also
+                    // makes a final close-time attempt.
+                    let _ = durability.flush_if_needed(&connection);
+                    stopped = thread_wake.0.lock();
+                }
+                drop(stopped);
+                let _ = durability.flush_if_needed(&connection);
+            })?;
+
+        Ok(Self {
+            wake,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for AutoFlusher {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            *self.wake.0.lock() = true;
+            self.wake.1.notify_all();
+            let _ = thread.join();
+        }
+    }
+}
+
 // ── Connection-level disk operations ─────────────────────────────────────────
 //
 // These free functions hold the single source of truth for the on-disk
@@ -974,20 +1155,22 @@ impl<'a, V> CachedDiskValueRef<'a, V> {
 //
 // `durable` maps to redb's durability: `true` uses the
 // default durable (`Durability::Immediate`) commit, `false` uses
-// `Durability::None` (deferred fsync). This is applied to every write txn.
+// `Durability::None` (deferred fsync) plus the cache's background flusher, which bounds how
+// long a non-durable commit can stay unpersisted. This is applied to every write txn.
 
 /// Begin a write txn with the durability implied by `durable`.
 /// Durability is set on the fresh transaction (it only needs to be set before the
 /// eventual `commit`); callers then open the table and commit.
 fn begin_write(
     connection: &Database,
-    durable: bool,
+    durability: &WriteDurability,
 ) -> Result<redb::WriteTransaction, RedbCacheError> {
     let mut wtxn = connection.begin_write().map_err(RedbCacheError::storage)?;
-    if !durable {
+    if !durability.is_durable() {
         wtxn.set_durability(Durability::None)
             .map_err(RedbCacheError::storage)?;
     }
+    durability.mark_write();
     Ok(wtxn)
 }
 
@@ -996,7 +1179,7 @@ fn disk_cache_get<V>(
     key: &str,
     ttl: Option<Duration>,
     refresh: bool,
-    durable: bool,
+    durability: &WriteDurability,
     strict: bool,
 ) -> Result<Option<V>, RedbCacheError>
 where
@@ -1029,7 +1212,7 @@ where
             // re-read at the mutation path below). Only delete if the entry is
             // *still* corrupt; if it now decodes, adopt the fresh value and fall
             // through to the normal TTL handling.
-            let wtxn = begin_write(connection, durable)?;
+            let wtxn = begin_write(connection, durability)?;
             let healed: Result<Option<CachedDiskValue<V>>, RedbCacheError> = {
                 let mut table = wtxn.open_table(TABLE).map_err(RedbCacheError::storage)?;
                 // guard is dropped after .map(); table can be mutated below.
@@ -1091,7 +1274,7 @@ where
     //
     // redb serialises write transactions, so the re-read + conditional mutate
     // below is atomic against any concurrent writer.
-    let wtxn = begin_write(connection, durable)?;
+    let wtxn = begin_write(connection, durability)?;
     // Use a Result<Option<V>> block so errors propagate and table is dropped
     // before commit (redb requires WriteTransaction to outlive open Tables).
     let result: Result<Option<V>, RedbCacheError> = {
@@ -1168,12 +1351,12 @@ fn disk_cache_set<V>(
     key: &str,
     serialized: Vec<u8>,
     ttl: Option<Duration>,
-    durable: bool,
+    durability: &WriteDurability,
 ) -> Result<Option<V>, RedbCacheError>
 where
     V: DeserializeOwned,
 {
-    let wtxn = begin_write(connection, durable)?;
+    let wtxn = begin_write(connection, durability)?;
     // Copy the previous value's bytes (owned) before the guard/table are dropped,
     // but defer deserialization until after the commit: the new value must be
     // written regardless of whether the displaced value can be decoded. The set
@@ -1215,9 +1398,9 @@ fn disk_cache_set_no_return(
     connection: &Database,
     key: &str,
     serialized: Vec<u8>,
-    durable: bool,
+    durability: &WriteDurability,
 ) -> Result<(), RedbCacheError> {
-    let wtxn = begin_write(connection, durable)?;
+    let wtxn = begin_write(connection, durability)?;
     {
         let mut table = wtxn.open_table(TABLE).map_err(RedbCacheError::storage)?;
         table
@@ -1232,12 +1415,12 @@ fn disk_cache_remove<V>(
     connection: &Database,
     key: &str,
     ttl: Option<Duration>,
-    durable: bool,
+    durability: &WriteDurability,
 ) -> Result<Option<V>, RedbCacheError>
 where
     V: DeserializeOwned,
 {
-    let wtxn = begin_write(connection, durable)?;
+    let wtxn = begin_write(connection, durability)?;
     // Copy the removed bytes (owned) and commit before deserializing, so the entry
     // is removed regardless of whether its value can be decoded. The removal
     // succeeded, so an undecodable value is reported as `None` rather than an error.
@@ -1276,12 +1459,12 @@ where
 fn disk_cache_remove_entry<V>(
     connection: &Database,
     key: &str,
-    durable: bool,
+    durability: &WriteDurability,
 ) -> Result<Option<V>, RedbCacheError>
 where
     V: DeserializeOwned,
 {
-    let wtxn = begin_write(connection, durable)?;
+    let wtxn = begin_write(connection, durability)?;
     // Copy the removed bytes (owned) and commit before deserializing, so the entry
     // is removed regardless of whether its value can be decoded. The removal
     // succeeded, so an undecodable value is reported as `None` rather than an error.
@@ -1301,9 +1484,9 @@ where
 fn disk_cache_delete(
     connection: &Database,
     key: &str,
-    durable: bool,
+    durability: &WriteDurability,
 ) -> Result<bool, RedbCacheError> {
-    let wtxn = begin_write(connection, durable)?;
+    let wtxn = begin_write(connection, durability)?;
     let removed = {
         let mut table = wtxn.open_table(TABLE).map_err(RedbCacheError::storage)?;
         table
@@ -1318,8 +1501,11 @@ fn disk_cache_delete(
 /// Remove every entry from the cache table. Drops and recreates the table in a
 /// single write txn so subsequent read txns still find an (empty) table rather
 /// than erroring with `TableError::TableDoesNotExist`.
-fn disk_cache_clear(connection: &Database, durable: bool) -> Result<(), RedbCacheError> {
-    let wtxn = begin_write(connection, durable)?;
+fn disk_cache_clear(
+    connection: &Database,
+    durability: &WriteDurability,
+) -> Result<(), RedbCacheError> {
+    let wtxn = begin_write(connection, durability)?;
     wtxn.delete_table(TABLE).map_err(RedbCacheError::storage)?;
     wtxn.open_table(TABLE).map_err(RedbCacheError::storage)?;
     wtxn.commit().map_err(RedbCacheError::storage)?;
@@ -1346,7 +1532,7 @@ fn remove_expired_entries_impl<V>(
     connection: &Database,
     ttl: Option<Duration>,
     strict: bool,
-    durable: bool,
+    durability: &WriteDurability,
 ) -> Result<usize, RedbCacheError>
 where
     V: Serialize + DeserializeOwned,
@@ -1404,7 +1590,7 @@ where
     // ensures we never delete a live entry. The returned count reflects the
     // number of entries *actually* removed, not the number found in the scan.
     let mut removed = 0usize;
-    let wtxn = begin_write(connection, durable)?;
+    let wtxn = begin_write(connection, durability)?;
     {
         let mut table = wtxn.open_table(TABLE).map_err(RedbCacheError::storage)?;
         for key in &expired_keys {
@@ -1571,7 +1757,7 @@ where
             &key.to_string(),
             ttl,
             refresh,
-            self.durable,
+            &self.durability,
             self.strict_deserialization,
         )
     }
@@ -1590,22 +1776,22 @@ where
             &key.to_string(),
             serialized,
             ttl,
-            self.durable,
+            &self.durability,
         )
     }
 
     fn cache_remove(&self, key: &K) -> Result<Option<V>, RedbCacheError> {
         let ttl = *self.ttl.lock();
-        disk_cache_remove(&self.connection, &key.to_string(), ttl, self.durable)
+        disk_cache_remove(&self.connection, &key.to_string(), ttl, &self.durability)
     }
 
     fn cache_remove_entry(&self, key: &K) -> Result<Option<(K, V)>, Self::Error> {
-        disk_cache_remove_entry(&self.connection, &key.to_string(), self.durable)
+        disk_cache_remove_entry(&self.connection, &key.to_string(), &self.durability)
             .map(|opt| opt.map(|v| (key.clone(), v)))
     }
 
     fn cache_delete(&self, key: &K) -> Result<bool, RedbCacheError> {
-        disk_cache_delete(&self.connection, &key.to_string(), self.durable)
+        disk_cache_delete(&self.connection, &key.to_string(), &self.durability)
     }
 
     /// Clear the on-disk cache table, removing every entry.
@@ -1620,7 +1806,7 @@ where
     /// return freed pages to the filesystem, and compaction is not currently exposed, so the
     /// file keeps its high-water-mark size and reuses that space for later writes.
     fn cache_clear(&self) -> Result<(), RedbCacheError> {
-        disk_cache_clear(&self.connection, self.durable)
+        disk_cache_clear(&self.connection, &self.durability)
     }
 
     /// Reset the on-disk cache table. `RedbCache` tracks no in-memory metrics,
@@ -1628,7 +1814,7 @@ where
     /// empties the backing redb table (durability per
     /// `durable`).
     fn cache_reset(&self) -> Result<(), RedbCacheError> {
-        disk_cache_clear(&self.connection, self.durable)
+        disk_cache_clear(&self.connection, &self.durability)
     }
 
     /// Returns `true` if the cache contains a non-expired entry for `key`.
@@ -1663,7 +1849,12 @@ where
     fn cache_set_ref(&self, key: &K, value: &V) -> Result<(), RedbCacheError> {
         let serialized = rmp_serde::to_vec(&CachedDiskValueRef::new(value))
             .map_err(RedbCacheError::serialization)?;
-        disk_cache_set_no_return(&self.connection, &key.to_string(), serialized, self.durable)
+        disk_cache_set_no_return(
+            &self.connection,
+            &key.to_string(),
+            serialized,
+            &self.durability,
+        )
     }
 }
 
@@ -1694,14 +1885,14 @@ where
     async fn async_cache_get(&self, key: &K) -> Result<Option<V>, RedbCacheError> {
         let connection = self.connection.clone();
         let key = key.to_string();
-        let (ttl, refresh, durable, strict) = (
+        let (ttl, refresh, durability, strict) = (
             *self.ttl.lock(),
             self.refresh.load(Ordering::Relaxed),
-            self.durable,
+            self.durability.clone(),
             self.strict_deserialization,
         );
         blocking::unblock(move || {
-            disk_cache_get::<V>(&connection, &key, ttl, refresh, durable, strict)
+            disk_cache_get::<V>(&connection, &key, ttl, refresh, &durability, strict)
         })
         .await
     }
@@ -1711,35 +1902,38 @@ where
     async fn async_cache_set(&self, key: K, value: V) -> Result<Option<V>, RedbCacheError> {
         let connection = self.connection.clone();
         let key = key.to_string();
-        let (ttl, durable) = (*self.ttl.lock(), self.durable);
+        let (ttl, durability) = (*self.ttl.lock(), self.durability.clone());
         let serialized = rmp_serde::to_vec(&CachedDiskValue::new(value))
             .map_err(RedbCacheError::serialization)?;
-        blocking::unblock(move || disk_cache_set::<V>(&connection, &key, serialized, ttl, durable))
-            .await
+        blocking::unblock(move || {
+            disk_cache_set::<V>(&connection, &key, serialized, ttl, &durability)
+        })
+        .await
     }
 
     async fn async_cache_remove(&self, key: &K) -> Result<Option<V>, RedbCacheError> {
         let connection = self.connection.clone();
         let key = key.to_string();
-        let (ttl, durable) = (*self.ttl.lock(), self.durable);
-        blocking::unblock(move || disk_cache_remove::<V>(&connection, &key, ttl, durable)).await
+        let (ttl, durability) = (*self.ttl.lock(), self.durability.clone());
+        blocking::unblock(move || disk_cache_remove::<V>(&connection, &key, ttl, &durability)).await
     }
 
     async fn async_cache_remove_entry(&self, key: &K) -> Result<Option<(K, V)>, Self::Error> {
         let connection = self.connection.clone();
         let key_str = key.to_string();
-        let durable = self.durable;
-        let v: Option<V> =
-            blocking::unblock(move || disk_cache_remove_entry::<V>(&connection, &key_str, durable))
-                .await?;
+        let durability = self.durability.clone();
+        let v: Option<V> = blocking::unblock(move || {
+            disk_cache_remove_entry::<V>(&connection, &key_str, &durability)
+        })
+        .await?;
         Ok(v.map(|v| (key.clone(), v)))
     }
 
     async fn async_cache_delete(&self, key: &K) -> Result<bool, RedbCacheError> {
         let connection = self.connection.clone();
         let key = key.to_string();
-        let durable = self.durable;
-        blocking::unblock(move || disk_cache_delete(&connection, &key, durable)).await
+        let durability = self.durability.clone();
+        blocking::unblock(move || disk_cache_delete(&connection, &key, &durability)).await
     }
 
     /// Async counterpart of [`ConcurrentCached::cache_clear`]: clears the
@@ -1747,8 +1941,8 @@ where
     /// per `durable`).
     async fn async_cache_clear(&self) -> Result<(), RedbCacheError> {
         let connection = self.connection.clone();
-        let durable = self.durable;
-        blocking::unblock(move || disk_cache_clear(&connection, durable)).await
+        let durability = self.durability.clone();
+        blocking::unblock(move || disk_cache_clear(&connection, &durability)).await
     }
 
     /// Async counterpart of [`ConcurrentCached::cache_reset`]. `RedbCache`
@@ -1756,8 +1950,8 @@ where
     /// [`ConcurrentCachedAsync::async_cache_clear`](crate::ConcurrentCachedAsync::async_cache_clear).
     async fn async_cache_reset(&self) -> Result<(), RedbCacheError> {
         let connection = self.connection.clone();
-        let durable = self.durable;
-        blocking::unblock(move || disk_cache_clear(&connection, durable)).await
+        let durability = self.durability.clone();
+        blocking::unblock(move || disk_cache_clear(&connection, &durability)).await
     }
 
     /// Returns `true` if the cache contains a non-expired entry for `key`.
@@ -1795,14 +1989,14 @@ where
     ) -> impl std::future::Future<Output = Result<(), RedbCacheError>> + Send {
         let connection = self.connection.clone();
         let key = key.to_string();
-        let durable = self.durable;
+        let durability = self.durability.clone();
         // Serialize eagerly; defer any error into the future.
         let serialized = rmp_serde::to_vec(&CachedDiskValueRef::new(value))
             .map_err(RedbCacheError::serialization);
         async move {
             let serialized = serialized?;
             blocking::unblock(move || {
-                disk_cache_set_no_return(&connection, &key, serialized, durable)
+                disk_cache_set_no_return(&connection, &key, serialized, &durability)
             })
             .await
         }
@@ -2245,6 +2439,63 @@ mod tests {
     }
 
     #[test]
+    fn default_durability_is_bounded_not_per_write() {
+        let tmp_dir = temp_dir!();
+        let cache: RedbCache<u32, u32> = RedbCache::builder("default-bounded-durability")
+            .disk_dir(tmp_dir.path())
+            .build()
+            .expect("error building disk cache");
+
+        assert!(
+            !cache.durability.is_durable(),
+            "the default must not fsync every write"
+        );
+        assert!(
+            cache._flusher.is_some(),
+            "non-durable writes need a background flusher"
+        );
+    }
+
+    #[test]
+    fn durable_true_has_no_background_flusher() {
+        let tmp_dir = temp_dir!();
+        let cache: RedbCache<u32, u32> = RedbCache::builder("durable-no-flusher")
+            .disk_dir(tmp_dir.path())
+            .durable(true)
+            .build()
+            .expect("error building disk cache");
+
+        assert!(cache.durability.is_durable());
+        assert!(
+            cache._flusher.is_none(),
+            "durable(true) already fsyncs every write"
+        );
+    }
+
+    #[test]
+    fn zero_flush_interval_is_rejected_for_non_durable_cache() {
+        let tmp_dir = temp_dir!();
+        let result = RedbCache::<u32, u32>::builder("zero-flush-interval")
+            .disk_dir(tmp_dir.path())
+            .durable(false)
+            .flush_interval(Duration::ZERO)
+            .build();
+
+        assert!(
+            matches!(
+                result,
+                Err(RedbCacheBuildError::Build(
+                    super::super::BuildError::InvalidValue {
+                        field: "flush_interval",
+                        ..
+                    }
+                ))
+            ),
+            "a zero flush interval must be rejected rather than spinning the flusher"
+        );
+    }
+
+    #[test]
     fn flush_forces_durable_commit_and_preserves_data() {
         let tmp_dir = temp_dir!();
         // Opt into Durability::None writes so flush() has buffered writes to persist.
@@ -2372,6 +2623,9 @@ mod tests {
         let a: RedbCache<u32, u32> = RedbCache::builder(NAME)
             .disk_dir(dir_a.path())
             .durable(false) // opt into Durability::None writes
+            // Keep the background flusher out of the way: this test asserts the pre-flush
+            // snapshot is missing the write.
+            .flush_interval(Duration::from_secs(60))
             .build()
             .unwrap();
         a.cache_set(TEST_KEY, TEST_VAL).unwrap(); // Durability::None (not yet durable)

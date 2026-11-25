@@ -458,10 +458,11 @@ pub fn once(args: TokenStream, input: TokenStream) -> TokenStream {
 /// - `disk_dir`: (optional, string) in the case of `RedbCache` specify the directory in which the redb
 ///   database file is stored. Defaults to a system cache directory. Requires `disk = true`; mutually
 ///   exclusive with `create`. Using it on the in-memory or `redis` path is a compile error.
-/// - `durable`: (optional, bool) in the case of `RedbCache` specify whether to synchronize the cache to disk
-///   (fsync) on each cache change. Defaults to `true` (durable). Set `false` to trade durability for write
-///   throughput. Requires `disk = true`; mutually exclusive with `create`; using it on the in-memory or
-///   `redis` path is a compile error.
+/// - `durable`: (optional, bool) in the case of `RedbCache` specify whether to fsync the cache to disk on
+///   each cache change. Defaults to `false`, which uses non-durable redb commits and coalesces them into a
+///   durable commit at most once per `RedbCache` flush interval (500 ms), bounding crash loss without an
+///   fsync per write. Set `true` to fsync every write. Requires `disk = true`; mutually exclusive with
+///   `create`; using it on the in-memory or `redis` path is a compile error.
 /// - `companions_vis`: (optional, string) override the visibility of the generated `{fn}_no_cache` and
 ///   `{fn}_prime_cache` companions independently of the cached function's own visibility.
 ///   Accepts any Rust visibility expression (e.g. `"pub"`, `"pub(crate)"`, `"pub(super)"`, or `""` for

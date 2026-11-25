@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `RedbCache` now defaults to bounded durability rather than fsync-per-write. `durable(false)`
+  still commits with redb's `Durability::None` (no fsync per write), but a background flusher
+  promotes pending writes with a durable commit at least once per flush interval, so a crash or
+  power loss loses at most the recent window instead of every write since the last explicit
+  `flush()`. The default interval is 500 ms and is configurable with
+  `RedbCacheBuilder::flush_interval(Duration)`; a zero interval is rejected. `durable(true)`
+  keeps the per-write fsync guarantee, and `flush()` / `async_flush()` still force an immediate
+  durable commit. See `specs/design/0058-redb-bounded-durability.md`.
+
 ## [4.1.1] - 2026-11-03
 
 ### Fixed
